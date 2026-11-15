@@ -1,0 +1,13 @@
+netscan/
+├── netscan.py          # GUI entry point
+├── core/
+│   ├── scanner.py      # airodump wrapper, parses CSV output
+│   ├── attacker.py     # deauth (aireplay / scapy)
+│   ├── capture.py      # hcxpcapngtool, handshake validation
+│   ├── cracker.py      # hashcat / aircrack subprocess
+│   └── interface.py    # monitor mode on/off, interface detection
+├── data/
+│   ├── captures/       # .cap files land here
+│   ├── hashes/         # .hc22000 files
+│   └── wordlists       # symlink to rockyou, cupp output
+└── requirements.txt
